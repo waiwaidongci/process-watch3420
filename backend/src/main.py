@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy import text
 from .config.database import Base,engine
+from .config.schema_upgrade import upgrade_schema
 from .config.settings import SEED_DEMO
 from . import models
 from .routes import auth,streams,baselines,runs,investigations,audits
@@ -12,6 +13,7 @@ from .services.run_service import queue
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
+    upgrade_schema(engine)
     if SEED_DEMO:
         try:
             from scripts.seed_demo import seed

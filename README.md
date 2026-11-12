@@ -12,7 +12,7 @@
 | analyst / 工艺分析师 | 阅读、冻结基线、创建运行、提交调查；无法审批或改来源备注 | 解释信号、提出复查动作 |
 | viewer / 工艺观察员 | 所有页面只读；仅获批运行可导出 | 阅读结果和批准记录 |
 
-所有角色导出前均须有同一运行的获批调查记录。批准代表允许研究证据归档，不代表产品合格或过程能力保证。
+所有角色导出前均须有同一运行的获批调查记录。同一运行可以有多份调查，但只有一份**生效结论**；发起复议会立即暂停该运行导出，复议获批后才替换生效结论，复议退回则继续保持暂停。批准代表允许研究证据归档，不代表产品合格或过程能力保证。
 
 ## 启动
 
@@ -31,7 +31,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 | analyst@qingzhen.demo | Qingzhen2026! | analyst |
 | viewer@qingzhen.demo | Qingzhen2026! | viewer |
 
-恰好5服务：frontend / backend / worker / db / redis，全部有健康检查与依赖。数据库和Redis分别使用命名卷，backend/worker共享artifacts卷；worker阻塞轮询Redis并每2秒写心跳。后端初次通过ORM metadata建表；`migrations/001_initial.sql`是索引迁移示例，结构升级需自行审查迁移。
+恰好5服务：frontend / backend / worker / db / redis，全部有健康检查与依赖。数据库和Redis分别使用命名卷，backend/worker共享artifacts卷；worker阻塞轮询Redis并每2秒写心跳。后端初次通过ORM metadata建表，并对已部署PostgreSQL执行幂等的`src/config/schema_upgrade.py`升级；`migrations/001_initial.sql`是索引迁移示例，`migrations/002_reconsideration.sql`为复议字段与索引迁移；其他结构升级需自行审查迁移。
 
 ## 数据与一天的剧本
 
@@ -46,8 +46,19 @@ seed以邮箱、stream.code、measurement.source_key、baseline.name及预置run
 5. 09:12 在I/MR/EWMA之间切换，确认控制界限与外部规格是两套线。
 6. 检查首个触发位置、Cp/Cpk数值及“不可作能力结论”提示；正态性、自相关未检验。
 7. 提交“后段均值偏移”调查，记录温控、量具和追加独立采样的复查动作。
-8. 09:30 程砚以admin审阅，记录至少8字意见，批准或退回；重复审批409拒绝。
+8. 09:30 程砚以admin审阅，记录至少8字意见，批准或退回；重复审批409拒绝，两位负责人同时提交相反意见时只接受首个决定。
 9. 顾远以viewer打开获批档案，下载160点CSV和每点信号/输入SHA256，不能修改研究。
+10. 若09:12之后出现相反结论，沈微对当前生效结论发起复议：该运行导出立即暂停；复议获批则以新结论替换生效结论并恢复导出，复议退回则原结论和档案保留、导出保持暂停。
+
+## 调查、复议与生效结论
+
+- **生效结论**：同一运行中最近一次获批且未被取代的调查。旧批准记录不删除，只在 `superseded_by` 中保留取代关系并继续在档案中展示。
+- **发起复议**：运行已有生效结论时，新调查自动作为复议（`kind=reconsideration`），指向当前生效结论；也可显式调用 `POST /investigations/{id}/reconsider`。同一运行同时只允许一份待复核复议。
+- **暂停规则**：复议提交即暂停导出；复议退回后也不自动恢复，必须由新的复议获批后才解除。复议获批时在同一事务内把旧批准标记为已被取代，并让新批准成为唯一生效结论。
+- **首个决定**：复核按运行加行锁并锁定调查记录；同一份调查的并行相反意见只有先到者生效，后到者收到409，避免最后写入者覆盖。
+- **可辨明**：`/runs`、`/investigations` 返回生效/取代/复议状态；观察总览、信号与能力、调查与复核页显示当前生效结论与复议暂停原因；导出CSV带生效调查、复核人与复议状态元数据行及 `X-Effective-Investigation` / `X-Reconsideration-Status` 响应头。
+- **兼容旧数据**：已有 `approved` 调查（如T-01演示档案）没有取代标记时自动视为生效结论，可继续沿用。
+
 
 ## 算法和口径
 
@@ -61,7 +72,7 @@ seed以邮箱、stream.code、measurement.source_key、baseline.name及预置run
 
 ## 页面与工程
 
-六页：观察总览、测量来源、基线与运行、信号与能力、调查与复核、操作留痕。五个业务实体MeasurementStream / Measurement / Baseline / ControlRun / Investigation分别有模型、schema、service、route、前端API/store与界面；User/Audit是横切实体。
+六页：观察总览、测量来源、基线与运行、信号与能力、调查与复核、操作留痕。五个业务实体MeasurementStream / Measurement / Baseline / ControlRun / Investigation分别有模型、schema、service、route、前端API/store与界面；User/Audit是横切实体。调查实体额外承载复议类型、被复议对象与取代关系。
 
 | 部分 | 技术 |
 |---|---|
@@ -74,11 +85,13 @@ seed以邮箱、stream.code、measurement.source_key、baseline.name及预置run
 backend/src/{models,schemas,services,controllers,routes,middlewares,utils,constants,config}
 backend/src/{main.py,worker.py}
 backend/scripts/seed_demo.py
+backend/src/config/schema_upgrade.py
 backend/migrations/001_initial.sql
+backend/migrations/002_reconsideration.sql
 frontend/src/{api,stores,types,components,hooks,pages,router,utils,constants}
 ```
 
-共享业务组件：RunSummary、ControlChart在首页/结果复用；StreamSelector在来源/配置复用。通用DataTable/Notice/StatusBadge、useProcessData/useAction和format独立。共享枚举位置：角色`backend/src/constants/roles.py`、运行`status.py`、复核`review.py`对应`frontend/src/constants/enums.ts`；运行与权限实际使用同名值。两中间件独立处理全局错误与登录限流；审计覆盖登录、来源备注、冻结、队列完成、调查和审批。JWT8小时、PBKDF2-SHA256密码、每次按数据库角色授权。
+共享业务组件：RunSummary、ControlChart在首页/结果复用；ReleaseStatus在结果/复核复用；StreamSelector在来源/配置复用。通用DataTable/Notice/StatusBadge、useProcessData/useAction和format独立。共享枚举位置：角色`backend/src/constants/roles.py`、运行`status.py`、复核`review.py`对应`frontend/src/constants/enums.ts`；运行与权限实际使用同名值。两中间件独立处理全局错误与登录限流；审计覆盖登录、来源备注、冻结、队列完成、调查、复议、批准/退回、取代与导出。JWT8小时、PBKDF2-SHA256密码、每次按数据库角色授权。
 
 ## 配置与开发
 
@@ -101,7 +114,7 @@ docker compose down -v --remove-orphans
 
 ## 已知边界
 
-合成冻结数据，没有真实仪器接入或CSV上传。单worker不提供running任务自动恢复、事务outbox或多实例执行锁；崩溃需重新提交。登录限流为单进程内存级。未做正态性/自相关/测量系统分析、能力置信区间或多变量控制，任何审批都不控制设备。初次建表不是完整迁移链。Google Fonts不可用时回退字体。
+合成冻结数据，没有真实仪器接入或CSV上传。单worker不提供running任务自动恢复、事务outbox或多实例执行锁；崩溃需重新提交。登录限流为单进程内存级。未做正态性/自相关/测量系统分析、能力置信区间或多变量控制，任何审批都不控制设备。初次建表不是完整迁移链；复议列由启动时的幂等升级补到旧库。Google Fonts不可用时回退字体。
 
 ## License
 
